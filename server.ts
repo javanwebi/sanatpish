@@ -22,6 +22,7 @@ const PLACEHOLDER_KEYS = new Set([
   'YOUR_GEMINI_API_KEY_HERE',
   'PASTE_NEW_KEY_HERE',
   'MY_APP_URL',
+  'SET_A_LONG_RANDOM_WORKER_TOKEN',
 ]);
 
 function getGeminiKey(): string | undefined {
@@ -122,9 +123,121 @@ async function generateWithModelCascade(
 
 const app = express();
 const PORT = 3000;
+const CUSTOMER_IMAGES_DIR = path.join(process.cwd(), 'imagemoshtari');
+const CUSTOMER_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_PART_RECOGNITION_WORKER_URL =
+  'https://atlas-aishenasaei.javanwebio.workers.dev';
+
+function getPartRecognitionWorkerUrl(): string {
+  const configured =
+    (process.env.PART_RECOGNITION_WORKER_URL || DEFAULT_PART_RECOGNITION_WORKER_URL).trim();
+  try {
+    const url = new URL(configured);
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+      throw new Error('Worker URL must be an HTTPS origin.');
+    }
+    return url.origin;
+  } catch {
+    throw new Error('PART_RECOGNITION_WORKER_URL باید یک آدرس HTTPS معتبر باشد.');
+  }
+}
+
+function getPublicAppBaseUrl(req: express.Request): string {
+  // Derive the public host from the request/proxy headers so PUBLIC_APP_URL is
+  // not required. Prefer X-Forwarded-Host when the reverse proxy provides it.
+  const host = String(req.get('x-forwarded-host') || req.get('host') || '')
+    .split(',')[0]
+    .trim();
+  if (!host || /[\s/@?#]/.test(host)) {
+    throw new Error('آدرس عمومی از Host یا X-Forwarded-Host درخواست قابل تشخیص نیست.');
+  }
+
+  const forwardedProto = String(req.get('x-forwarded-proto') || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const isLocalHost = /^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host);
+  // Public customer-image URLs must be HTTPS for Gemini. Only local development
+  // uses HTTP when the proxy did not explicitly indicate HTTPS.
+  const protocol = forwardedProto === 'https' || req.secure || !isLocalHost
+    ? 'https'
+    : 'http';
+
+  let url: URL;
+  try {
+    url = new URL(`${protocol}://${host}`);
+  } catch {
+    throw new Error('Host یا X-Forwarded-Host درخواست معتبر نیست.');
+  }
+
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('Host درخواست باید فقط شامل نام دامنه و پورت باشد.');
+  }
+  if (!isLocalHost && url.port) {
+    throw new Error('دامنهٔ عمومی تصویر باید از پورت استاندارد HTTPS استفاده کند.');
+  }
+
+  return url.origin;
+}
+
+function customerImagePublicUrl(req: express.Request, fileName: string): string {
+  return `${getPublicAppBaseUrl(req)}/imagemoshtari/${encodeURIComponent(fileName)}`;
+}
+
+function normalizeBrowserOrigin(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+const CONFIGURED_CORS_ORIGINS = new Set(
+  (process.env.CORS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((origin) => normalizeBrowserOrigin(origin.trim()))
+    .filter((origin): origin is string => Boolean(origin))
+);
+
+app.use((req, res, next) => {
+  const originHeader = req.get('origin');
+  if (originHeader) {
+    const origin = normalizeBrowserOrigin(originHeader);
+    let sameOrigin = false;
+    try {
+      sameOrigin = origin === normalizeBrowserOrigin(getPublicAppBaseUrl(req));
+    } catch {
+      // The request host could not be derived; configured CORS origins still work.
+    }
+    if (!origin || (!sameOrigin && !CONFIGURED_CORS_ORIGINS.has(origin))) {
+      return res.status(403).json({ error: { message: 'مبدأ درخواست در فهرست مجاز نیست.' } });
+    }
+    res.setHeader('Access-Control-Allow-Origin', originHeader);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ extended: true, limit: '30mb' }));
+
+// Uploaded customer images are kept in a non-indexed, UUID-named folder so the
+// Cloudflare Worker can fetch them by URL. Never commit these files to Git.
+app.use(
+  '/imagemoshtari',
+  express.static(CUSTOMER_IMAGES_DIR, {
+    dotfiles: 'deny',
+    index: false,
+    setHeaders(res) {
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+    },
+  })
+);
 
 // Health Check
 app.get('/api/health', (req, res) => {
@@ -1641,7 +1754,11 @@ async function cropToBoundingBox(buffer: Buffer, bb: NormBox, padRatio = 0.08): 
 // Compute visual candidates for a user photo. Features are extracted from the
 // full image AND (when available) the cropped part region; the best match
 // against each catalog image wins.
-async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormBox): Promise<VisualCandidateResult> {
+async function getVisualCandidateResult(
+  queryBuffer: Buffer,
+  boundingBox?: NormBox,
+  includeDeepEmbeddings = true
+): Promise<VisualCandidateResult> {
   if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
     return { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
   }
@@ -1663,7 +1780,7 @@ async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormB
   // Deep embedding of the same query variants (full + cropped). Degrades to
   // hash-only retrieval when the Jina key is absent or the API is down.
   const queryEmbs: (number[] | null)[] = [];
-  if (embIndexReady && JINA_API_KEY) {
+  if (includeDeepEmbeddings && embIndexReady && JINA_API_KEY) {
     try {
       const embBufs = [queryBuffer];
       if (dualList.length > 1 && boundingBox) {
@@ -2302,11 +2419,457 @@ async function verifyCandidatesVisually(
   return null;
 }
 
+type CustomerImageMime = 'image/jpeg' | 'image/png' | 'image/webp';
+
+function normalizeCustomerImageMime(value: string | undefined): CustomerImageMime | null {
+  const mime = String(value || '').split(';')[0].trim().toLowerCase();
+  const normalized = mime === 'image/jpg' ? 'image/jpeg' : mime;
+  return ['image/jpeg', 'image/png', 'image/webp'].includes(normalized)
+    ? (normalized as CustomerImageMime)
+    : null;
+}
+
+async function readResponseBufferLimited(response: Response, maxBytes: number): Promise<Buffer> {
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (declaredLength > maxBytes) throw new Error('حجم تصویر بیش از ۱۰ مگابایت است.');
+  if (!response.body?.getReader) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > maxBytes) throw new Error('حجم تصویر بیش از ۱۰ مگابایت است.');
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error('حجم تصویر بیش از ۱۰ مگابایت است.');
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function persistCustomerImage(
+  input: Buffer,
+  declaredMime: string | undefined
+): Promise<{ fileName: string; mimeType: 'image/jpeg'; sizeBytes: number }> {
+  if (!Buffer.isBuffer(input) || input.length === 0) {
+    throw new Error('فایل تصویر خالی یا نامعتبر است.');
+  }
+  if (input.length > CUSTOMER_IMAGE_MAX_BYTES) {
+    throw new Error('حجم تصویر بیش از ۱۰ مگابایت است.');
+  }
+
+  const normalizedMime = normalizeCustomerImageMime(declaredMime);
+  if (!normalizedMime) {
+    throw new Error('فقط تصاویر JPEG، PNG و WEBP پشتیبانی می‌شوند.');
+  }
+
+  const sharpOptions = { limitInputPixels: 40_000_000 };
+  const metadata = await sharp(input, sharpOptions).metadata();
+  const actualMimeByFormat: Record<string, CustomerImageMime> = {
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    webp: 'image/webp',
+  };
+  const actualMime = metadata.format ? actualMimeByFormat[metadata.format] : undefined;
+  if (!actualMime || actualMime !== normalizedMime) {
+    throw new Error('نوع واقعی فایل با پسوند یا نوع ارسالی تصویر مطابقت ندارد.');
+  }
+
+  const optimized = await sharp(input, sharpOptions)
+    .rotate()
+    .flatten({ background: '#ffffff' })
+    .resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+
+  await fs.promises.mkdir(CUSTOMER_IMAGES_DIR, { recursive: true });
+  const fileName = `${crypto.randomUUID()}.jpg`;
+  await fs.promises.writeFile(path.join(CUSTOMER_IMAGES_DIR, fileName), optimized, { flag: 'wx' });
+  return { fileName, mimeType: 'image/jpeg', sizeBytes: optimized.length };
+}
+
+function validatePresetImageImportUrl(input: string): string | null {
+  try {
+    const url = new URL(input);
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname.toLowerCase() !== 'raw.githubusercontent.com' ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.search ||
+      url.hash
+    ) {
+      return null;
+    }
+    const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    if (
+      segments.length !== 4 ||
+      segments[0] !== 'javanweb' ||
+      segments[1] !== 'imagesatlas' ||
+      segments[2] !== 'main' ||
+      !/^e\(\d+\)\.png$/i.test(segments[3])
+    ) {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+app.post(
+  '/api/ai/customer-images',
+  express.raw({ type: ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'], limit: CUSTOMER_IMAGE_MAX_BYTES }),
+  async (req, res) => {
+    try {
+      if (!Buffer.isBuffer(req.body)) {
+        return res.status(415).json({ error: { message: 'فقط فایل JPEG، PNG یا WEBP ارسال کنید.' } });
+      }
+      const saved = await persistCustomerImage(req.body, req.get('content-type'));
+      return res.status(201).json({
+        imageUrl: customerImagePublicUrl(req, saved.fileName),
+        fileName: saved.fileName,
+        mimeType: saved.mimeType,
+        sizeBytes: saved.sizeBytes,
+      });
+    } catch (error: any) {
+      const status = /حجم تصویر/.test(error?.message || '') ? 413 : 400;
+      console.warn('[Customer Image Upload] Upload rejected:', error?.message || 'invalid image');
+      return res.status(status).json({
+        error: { message: error?.message || 'ذخیره تصویر انجام نشد.' },
+      });
+    }
+  }
+);
+
+// Preset catalogue photos are copied into the same folder so the Worker still
+// receives one public image URL and follows the exact same analysis path.
+app.post('/api/ai/customer-images/import', async (req, res) => {
+  const safeUrl = validatePresetImageImportUrl(String(req.body?.imageUrl || '').trim());
+  if (!safeUrl) {
+    return res.status(400).json({
+      error: { message: 'آدرس تصویر نمونه معتبر نیست؛ فقط تصاویر کاتالوگ مجازند.' },
+    });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await fetch(safeUrl, {
+      method: 'GET',
+      redirect: 'error',
+      headers: { Accept: 'image/png,image/jpeg,image/webp' },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return res.status(502).json({ error: { message: 'دانلود تصویر نمونه ناموفق بود.' } });
+    }
+    const image = await readResponseBufferLimited(response, CUSTOMER_IMAGE_MAX_BYTES);
+    const saved = await persistCustomerImage(image, response.headers.get('content-type') || undefined);
+    return res.status(201).json({
+      imageUrl: customerImagePublicUrl(req, saved.fileName),
+      fileName: saved.fileName,
+      mimeType: saved.mimeType,
+      sizeBytes: saved.sizeBytes,
+    });
+  } catch (error: any) {
+    const timedOut = error?.name === 'AbortError';
+    console.warn('[Customer Image Upload] Preset import failed:', timedOut ? 'timeout' : error?.message || 'fetch error');
+    return res.status(timedOut ? 504 : 502).json({
+      error: { message: timedOut ? 'دریافت تصویر نمونه بیش از حد طول کشید.' : error?.message || 'دریافت تصویر نمونه ناموفق بود.' },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+function getUploadedCustomerImageFromUrl(
+  input: string,
+  req: express.Request
+): { imageUrl: string; fileName: string; buffer: Buffer } {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error('آدرس تصویر آپلودشده معتبر نیست.');
+  }
+
+  const expectedOrigin = getPublicAppBaseUrl(req);
+  if (
+    url.origin !== expectedOrigin ||
+    url.search ||
+    url.hash ||
+    url.username ||
+    url.password ||
+    url.port
+  ) {
+    throw new Error('آدرس تصویر باید از همین سرور و پوشه imagemoshtari باشد.');
+  }
+
+  const match = url.pathname.match(
+    /^\/imagemoshtari\/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jpg)$/i
+  );
+  if (!match) throw new Error('مسیر تصویر آپلودشده معتبر نیست.');
+
+  const fileName = match[1];
+  const root = path.resolve(CUSTOMER_IMAGES_DIR);
+  const filePath = path.resolve(root, fileName);
+  if (!filePath.startsWith(`${root}${path.sep}`)) {
+    throw new Error('مسیر فایل تصویر معتبر نیست.');
+  }
+  if (!fs.existsSync(filePath)) {
+    throw new Error('تصویر آپلودشده در پوشه imagemoshtari پیدا نشد.');
+  }
+  return {
+    imageUrl: url.toString(),
+    fileName,
+    buffer: fs.readFileSync(filePath),
+  };
+}
+
+async function callPartRecognitionWorker(
+  imageUrl: string,
+  fileName: string,
+  prompt: string
+): Promise<any> {
+  const workerUrl = `${getPartRecognitionWorkerUrl()}/v1/chat/completions`;
+  const configuredTimeout = Number(process.env.PART_RECOGNITION_WORKER_TIMEOUT_MS || 12_000);
+  const timeoutMs = Number.isFinite(configuredTimeout)
+    ? Math.max(3_000, Math.min(configuredTimeout, 30_000))
+    : 12_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const sharedToken = (process.env.PART_RECOGNITION_WORKER_TOKEN || '').trim();
+    if (sharedToken) headers.Authorization = `Bearer ${sharedToken}`;
+    const geminiKey = getGeminiKey();
+    if (geminiKey) headers['X-Gemini-Key'] = geminiKey;
+
+    const payload: any = { image_url: imageUrl, file_name: fileName, prompt };
+    if (geminiKey) payload.gemini_api_key = geminiKey;
+
+    const response = await fetch(workerUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+
+    const responseText = await response.text();
+    let data: any = null;
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      console.warn('[AI Search Worker] Non-JSON response received (likely HTML/error page):', responseText.slice(0, 200));
+    }
+
+    if (!response.ok || !data || typeof data !== 'object') {
+      const msg = data?.error?.message || data?.message || (responseText.startsWith('<!') ? 'ورکر شناسایی تصویر در دسترس نیست یا صفحه خطا بازگرداند.' : responseText.slice(0, 200));
+      console.warn('[AI Search Worker warning]:', msg);
+      return { success: false, recognition: null, message: msg };
+    }
+    return data;
+  } catch (error: any) {
+    const timedOut = error?.name === 'AbortError';
+    console.warn('[AI Search Worker warning]:', timedOut ? 'Worker request timed out' : error?.message);
+    return { success: false, recognition: null, message: timedOut ? 'مهلت انتظار پاسخ ورکر تمام شد.' : 'ارتباط با ورکر شناسایی تصویر برقرار نشد.' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildWorkerAnalysisPrompt(body: any, stage: 'quick' | 'refined'): string {
+  const safeText = (value: unknown, max = 500) =>
+    String(value ?? '').trim().replace(/[\u0000-\u001f]+/g, ' ').slice(0, max);
+  const length = safeText(body?.length, 40);
+  const width = safeText(body?.width, 40);
+  const pitch = safeText(body?.pitch, 40);
+  const application = safeText(body?.application);
+  const features = safeText(body?.features);
+  return [
+    'تصویر یک قطعه صنعتی است. قطعه را فقط با شواهد قابل مشاهده بررسی کن؛ مشخصات نامعلوم را حدس قطعی نزن.',
+    `مرحله تحلیل: ${stage === 'quick' ? 'شناسایی سریع فقط از تصویر' : 'تحلیل تصویر همراه با اطلاعات تکمیلی'}.`,
+    length ? `طول اعلامی: ${length} میلی‌متر.` : '',
+    width ? `عرض اعلامی: ${width} میلی‌متر.` : '',
+    pitch ? `گام یا ضخامت اعلامی: ${pitch} میلی‌متر.` : '',
+    application ? `کاربرد اعلامی مشتری: ${application}` : '',
+    features ? `ویژگی‌های اعلامی مشتری: ${features}` : '',
+    'برای قطعه مشابه، فقط شکل و ویژگی‌های ظاهری را توصیف کن و بین تطبیق دقیق و شباهت تمایز بگذار.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function mapWorkerVisualCandidate(candidate: any, exact: boolean): any {
+  const distance = Number(candidate?.visualDistance);
+  const similarity = exact
+    ? 99
+    : Math.max(55, Math.min(92, Number(candidate?.similarityScore) || Math.round(99 - distance * 55)));
+  const name = String(candidate?.name || candidate?.categoryName || 'قطعه صنعتی مشابه');
+  return {
+    code: String(candidate?.code || ''),
+    name,
+    brand: String(candidate?.brand || ''),
+    type: String(candidate?.categoryName || candidate?.subcategory || ''),
+    similarityScore: similarity,
+    matchReason: exact
+      ? 'تصویر ارسالی با تصویر مرجع این کالا در کاتالوگ اطلس تطبیق تصویری مستقیم دارد.'
+      : 'این مورد بر اساس ویژگی‌های ظاهری، یکی از نزدیک‌ترین تصاویر کاتالوگ است؛ تطبیق قطعی فقط با بررسی ابعاد و مشخصات فنی انجام می‌شود.',
+    distinction: exact
+      ? 'تطبیق مستقیم تصویر با مرجع کاتالوگ.'
+      : 'شباهت ظاهری به معنی یکسان بودن کد فنی یا سازگاری قطعی نیست.',
+    specs: Array.isArray(candidate?.specs) ? candidate.specs : [],
+    isVisualMatch: true,
+    visualDistance: Number.isFinite(distance) ? distance : undefined,
+    visualVerdict: exact ? 'exact_match' : 'very_similar',
+    visualVerdictFarsi: exact ? 'همونه (تطبیق تصویری مستقیم)' : 'شبیهه (نیازمند بررسی مشخصات)',
+    visualExplanation: exact
+      ? 'ویژگی‌های تصویر با عکس مرجع کاتالوگ بسیار نزدیک و در حد آستانه تطبیق مستقیم است.'
+      : 'شباهت بر اساس نمای ظاهری و ویژگی‌های تصویر محاسبه شده است؛ پیش از سفارش، ابعاد و کد فنی بررسی شود.',
+    forzaCode: candidate?.forzaCode,
+    cataloguePage: candidate?.cataloguePage,
+    image: candidate?.image,
+  };
+}
+
+async function analyzePartWithWorker(
+  req: express.Request,
+  body: any,
+  stage: 'quick' | 'refined'
+): Promise<any> {
+  const uploaded = getUploadedCustomerImageFromUrl(String(body?.imageUrl || '').trim(), req);
+  const normalizedForSearch = await sharp(uploaded.buffer)
+    .resize(480, 480, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 82 })
+    .toBuffer();
+
+  // Run the Worker recognition and the local catalog image retrieval concurrently.
+  // The local engine provides catalog matches; the Worker provides the AI description.
+  const [workerData, visualResult] = await Promise.all([
+    callPartRecognitionWorker(
+      uploaded.imageUrl,
+      uploaded.fileName,
+      buildWorkerAnalysisPrompt(body, stage)
+    ),
+    getVisualCandidateResult(normalizedForSearch, undefined, false),
+  ]);
+
+  const raw = workerData?.recognition && typeof workerData.recognition === 'object'
+    ? workerData.recognition
+    : null;
+  const exactRaw = (visualResult.candidates || []).filter(
+    (candidate: any) => Number(candidate.visualDistance) <= VISUAL_DUPLICATE_MAX
+  );
+  const similarRaw = (visualResult.candidates || [])
+    .filter((candidate: any) => {
+      const distance = Number(candidate.visualDistance);
+      return distance > VISUAL_DUPLICATE_MAX &&
+        (distance <= 0.34 || (typeof candidate.embSim === 'number' && candidate.embSim >= 0.9));
+    })
+    .slice(0, 4);
+
+  const exactMatches = exactRaw.slice(0, 4).map((candidate: any) => mapWorkerVisualCandidate(candidate, true));
+  const similarCandidates = similarRaw.map((candidate: any) => mapWorkerVisualCandidate(candidate, false));
+  const hasExact = exactMatches.length > 0;
+  const isAiRecognized = Boolean(workerData?.success && raw && raw.is_recognizable !== false);
+  const confidenceValue = Number(raw?.confidence);
+  const aiConfidence = Number.isFinite(confidenceValue)
+    ? Math.max(0, Math.min(100, confidenceValue <= 1 ? confidenceValue * 100 : confidenceValue))
+    : 0;
+  const detectedType = String(
+    raw?.product_name || raw?.type || raw?.category || (hasExact ? exactMatches[0].name : '') || 'قطعه صنعتی قابل بررسی'
+  );
+  const profileParts = [raw?.brand, raw?.model, raw?.product_code, raw?.size]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => String(value).trim());
+  const visualFeatures = Array.isArray(raw?.visual_features)
+    ? raw.visual_features.filter((value: unknown) => typeof value === 'string' && value.trim()).slice(0, 8)
+    : [];
+  const isRecognizable = isAiRecognized || hasExact;
+
+  const catalogAvailability = hasExact
+    ? {
+        status: 'confirmed_in_catalog',
+        statusFarsiTitle: 'تطبیق تصویری مستقیم با کالا در کاتالوگ پیدا شد',
+        statusFarsiMessage: 'تصویر ارسالی با تصویر مرجع یکی از کالاهای کاتالوگ تطبیق مستقیم دارد؛ کد و ابعاد کالا را پیش از سفارش بررسی کنید.',
+      }
+    : similarCandidates.length > 0
+      ? {
+          status: 'similar_in_catalog',
+          statusFarsiTitle: 'چند مدل از نظر ظاهر به تصویر شما نزدیک‌اند',
+          statusFarsiMessage: 'این موارد بر اساس شکل و ویژگی‌های ظاهری پیشنهاد شده‌اند؛ مشابهت تصویری، تطبیق فنی یا یکسان بودن قطعه را تضمین نمی‌کند.',
+        }
+      : {
+          status: 'custom_order_available',
+          statusFarsiTitle: 'تطبیق قابل اتکا در کاتالوگ پیدا نشد',
+          statusFarsiMessage: 'قطعه با تصویرهای فعلی کاتالوگ تطبیق قابل اتکایی نداشت. کد، ابعاد و نوشته‌های روی قطعه را برای بررسی دقیق‌تر ارسال کنید.',
+        };
+
+  return {
+    success: true,
+    isAiGenerated: isAiRecognized,
+    stage,
+    model: workerData?.model || 'Cloudflare Gemini Worker',
+    fallbackNotice: isRecognizable ? undefined : (workerData?.message || 'تصویر قطعه واضح یا قابل شناسایی نیست.'),
+    summary: {
+      whatYouSee: raw?.whatYouSee || raw?.what_you_see || visualFeatures.join('، ') || '',
+      detectedPartType: detectedType,
+      partFamilyFarsi: String(raw?.category || raw?.type || detectedType),
+      detectedProfile: profileParts.length ? profileParts.join(' | ') : 'مشخصات فنی از تصویر تأیید نشد',
+      material: raw?.material || undefined,
+      visualAnalysis: raw?.visual_analysis || raw?.whatYouSee || visualFeatures.join('، ') || 'تصویر با هوش مصنوعی بررسی و با تصاویر کاتالوگ مقایسه شد.',
+      confidence: hasExact ? Math.max(99, aiConfidence) : aiConfidence,
+      exactVisualMatch: hasExact,
+      catalogAvailability,
+      verifiedCandidateCount: exactRaw.length + similarRaw.length,
+    },
+    matchedProducts: exactMatches,
+    similarCandidates,
+    rejectedCandidates: [],
+    technicalAdvice: raw?.technical_advice || 'پیش از سفارش، ابعاد، جنس، نوع اتصال و کد فنی قطعه را با نمونه موجود تطبیق دهید.',
+    customerImageUrl: uploaded.imageUrl,
+  };
+}
+
 // POST: /api/ai/analyze-part
 // stage: 'quick'   = image-only instant identification (step 1)
 //        'refined' = image + dimensions + application (steps 2-3)
 app.post('/api/ai/analyze-part', async (req, res) => {
   const reqStage: 'quick' | 'refined' = req.body?.stage === 'quick' ? 'quick' : 'refined';
+
+  // Image requests go through the configured Cloudflare Worker by URL only.
+  // Text/dimension-only requests keep the existing backend behavior.
+  if (typeof req.body?.imageUrl === 'string' && req.body.imageUrl.trim()) {
+    try {
+      const result = await analyzePartWithWorker(req, req.body, reqStage);
+      return res.json(result);
+    } catch (error: any) {
+      const status = error?.statusCode || 502;
+      console.warn('[AI Search Worker] Recognition request failed:', error?.message || 'worker error');
+      return res.status(status).json({
+        error: {
+          message: error?.message || 'ارتباط با ورکر شناسایی تصویر برقرار نشد.',
+          type: status === 504 ? 'timeout' : 'worker_error',
+        },
+      });
+    }
+  }
+
   try {
     const {
       imageBase64,
@@ -4317,7 +4880,7 @@ async function start() {
 
   server.listen(PORT, '0.0.0.0', () => {
     const keyStatus = getGeminiKey()
-      ? `SET (len ${getGeminiKey()!.length}, prefix ${getGeminiKey()!.slice(0, 6)}...)`
+      ? 'SET'
       : 'MISSING - AI features will use offline fallback until GEMINI_API_KEY is set in .env';
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`[Server] Gemini Live Audio WebSocket ready on /api/live`);

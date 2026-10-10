@@ -10,6 +10,7 @@ export type AiAnalysisStage = 'quick' | 'refined';
 
 export interface AiPartAnalysisRequest {
   imageBase64?: string;
+  imageUrl?: string;
   mimeType?: string;
   length?: number;
   width?: number;
@@ -145,29 +146,94 @@ export const INDUSTRIAL_PRESET_SAMPLES: IndustrialPresetSample[] = [
   },
 ];
 
+function dataUrlToBlob(value: string, fallbackMime = 'image/jpeg'): Blob {
+  const match = value.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+  if (!match) {
+    const encoded = value.replace(/^base64,/, '');
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: fallbackMime });
+  }
+
+  const mimeType = match[1] || fallbackMime;
+  const payload = match[3] || '';
+  if (match[2]) {
+    const binary = atob(payload);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mimeType });
+  }
+  return new Blob([decodeURIComponent(payload)], { type: mimeType });
+}
+
+async function uploadResponseData(response: Response): Promise<{ imageUrl: string; fileName: string }> {
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.imageUrl) {
+    throw new Error(data?.error?.message || `بارگذاری تصویر ناموفق بود (کد ${response.status}).`);
+  }
+  return { imageUrl: String(data.imageUrl), fileName: String(data.fileName || '') };
+}
+
 export const aiVisualSearchService = {
-  async analyzePartWithAi(request: AiPartAnalysisRequest): Promise<AiPartAnalysisResult> {
-    // If the image is a URL (preset sample), convert it to base64 first
-    // so the AI always receives real pixel data.
-    let { imageBase64, mimeType } = request;
-    if (imageBase64 && /^https?:\/\//i.test(imageBase64.trim())) {
-      const converted = await this.urlToBase64(imageBase64.trim());
-      imageBase64 = converted.base64;
-      mimeType = converted.mimeType;
+  async uploadCustomerImage(source: string | Blob): Promise<{ imageUrl: string; fileName: string }> {
+    assertBackendConfigured();
+
+    if (typeof source === 'string' && /^https?:\/\//i.test(source.trim())) {
+      const response = await fetch(apiUrl('/api/ai/customer-images/import'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageUrl: source.trim() }),
+      });
+      return uploadResponseData(response);
     }
 
+    let blob: Blob;
+    if (typeof source === 'string') {
+      blob = source.startsWith('blob:')
+        ? await fetch(source).then(response => response.blob())
+        : dataUrlToBlob(source);
+    } else {
+      blob = source;
+    }
+
+    const mimeType = (blob.type || 'image/jpeg').split(';')[0].toLowerCase();
+    if (!['image/jpeg', 'image/jpg', 'image/png', 'image/webp'].includes(mimeType)) {
+      throw new Error('فقط تصاویر JPEG، PNG یا WEBP پشتیبانی می‌شوند.');
+    }
+
+    const response = await fetch(apiUrl('/api/ai/customer-images'), {
+      method: 'POST',
+      headers: { 'Content-Type': mimeType },
+      body: blob,
+    });
+    return uploadResponseData(response);
+  },
+
+  async analyzePartWithAi(request: AiPartAnalysisRequest): Promise<AiPartAnalysisResult> {
     assertBackendConfigured();
+
+    let imageUrl = request.imageUrl;
+    if (!imageUrl && request.imageBase64) {
+      imageUrl = (await this.uploadCustomerImage(request.imageBase64)).imageUrl;
+    }
+
+    const { imageBase64: _imageBase64, mimeType: _mimeType, ...analysisFields } = request;
+    const payload = imageUrl
+      ? { ...analysisFields, imageUrl }
+      : analysisFields;
 
     const response = await fetch(apiUrl('/api/ai/analyze-part'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ ...request, imageBase64, mimeType }),
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
-      throw new Error(`خطای ارتباط با سرور هوش مصنوعی: کد ${response.status}`);
+      const failure = await response.json().catch(() => null);
+      throw new Error(failure?.error?.message || `خطای ارتباط با سرور هوش مصنوعی: کد ${response.status}`);
     }
 
     const data: AiPartAnalysisResult = await response.json();

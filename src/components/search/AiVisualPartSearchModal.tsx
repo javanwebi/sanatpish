@@ -104,6 +104,9 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
 
   // Form states
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null);
+  const [isUploadingImage, setIsUploadingImage] = useState<boolean>(false);
+  const imageUploadSequenceRef = useRef(0);
   const [mimeType, setMimeType] = useState<string>('image/jpeg');
   const [length, setLength] = useState<string>('');
 
@@ -176,17 +179,36 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
     'بدون لغزش دندانه و انعطاف بالا',
   ];
 
-  // Handle file drop / select
-  const handleFile = async (file: File) => {
-    try {
-      setErrorMessage('');
-      const converted = await aiVisualSearchService.fileToBase64(file);
-      setSelectedImage(converted.base64);
-      setMimeType(converted.mimeType);
-      if (isUsingCamera) stopCamera();
-    } catch {
-      setErrorMessage('خطا در خواندن فایل تصویر. لطفاً تصویر دیگری انتخاب نمایید.');
-    }
+  const uploadSelectedImage = (source: string | Blob) => {
+    const sequence = ++imageUploadSequenceRef.current;
+    setIsUploadingImage(true);
+    setUploadedImageUrl(null);
+    aiVisualSearchService
+      .uploadCustomerImage(source)
+      .then(uploaded => {
+        if (sequence === imageUploadSequenceRef.current) {
+          setUploadedImageUrl(uploaded.imageUrl);
+        }
+      })
+      .catch((error: any) => {
+        if (sequence === imageUploadSequenceRef.current) {
+          setErrorMessage(error?.message || 'ذخیره تصویر در سرور انجام نشد.');
+        }
+      })
+      .finally(() => {
+        if (sequence === imageUploadSequenceRef.current) setIsUploadingImage(false);
+      });
+  };
+
+  // Upload the selected image to the server folder as soon as the customer selects it.
+  const handleFile = (file: File) => {
+    if (selectedImage?.startsWith('blob:')) URL.revokeObjectURL(selectedImage);
+    setErrorMessage('');
+    setUploadedImageUrl(null);
+    setSelectedImage(URL.createObjectURL(file));
+    setMimeType(file.type || 'image/jpeg');
+    if (isUsingCamera) stopCamera();
+    uploadSelectedImage(file);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -199,8 +221,12 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
 
   // Preset sample loader
   const loadPreset = (preset: IndustrialPresetSample) => {
+    if (selectedImage?.startsWith('blob:')) URL.revokeObjectURL(selectedImage);
     setSelectedImage(preset.imageUrl);
+    setUploadedImageUrl(null);
     setMimeType('image/jpeg');
+    setErrorMessage('');
+    uploadSelectedImage(preset.imageUrl);
     setLength(preset.length.toString());
     setWidth(preset.width.toString());
     if (preset.pitch) setPitch(preset.pitch.toString());
@@ -250,8 +276,12 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        if (selectedImage?.startsWith('blob:')) URL.revokeObjectURL(selectedImage);
         setSelectedImage(dataUrl);
+        setUploadedImageUrl(null);
         setMimeType('image/jpeg');
+        setErrorMessage('');
+        uploadSelectedImage(dataUrl);
         stopCamera();
       }
     }
@@ -260,7 +290,11 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
   // Reset all
   const resetForm = () => {
     stopCamera();
+    imageUploadSequenceRef.current += 1;
+    setIsUploadingImage(false);
+    if (selectedImage?.startsWith('blob:')) URL.revokeObjectURL(selectedImage);
     setSelectedImage(null);
+    setUploadedImageUrl(null);
     setLength('');
     setWidth('');
     setPitch('');
@@ -299,13 +333,19 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
       return;
     }
 
+    if (isUploadingImage) {
+      setErrorMessage('لطفاً صبر کنید تا بارگذاری تصویر روی سرور کامل شود.');
+      return;
+    }
+
     setErrorMessage('');
     setPendingStage(stage);
     setCurrentStep('analyzing');
 
     try {
       const result = await aiVisualSearchService.analyzePartWithAi({
-        imageBase64: selectedImage || undefined,
+        imageUrl: uploadedImageUrl || undefined,
+        imageBase64: uploadedImageUrl ? undefined : (selectedImage || undefined),
         mimeType: mimeType,
         length: length ? parseFloat(length) : undefined,
         width: width ? parseFloat(width) : undefined,
@@ -505,7 +545,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/jpeg,image/png,image/webp"
                     className="hidden"
                     onChange={e => {
                       if (e.target.files && e.target.files[0]) {
@@ -570,9 +610,9 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                       alt="قطعه انتخابی"
                       className="w-full h-full object-contain"
                     />
-                    <div className="absolute top-2 right-2 bg-emerald-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1 shadow-xs">
-                      <CheckCircle2 className="w-3 h-3" />
-                      <span>عکس بارگذاری شد</span>
+                    <div className={`absolute top-2 right-2 ${isUploadingImage ? 'bg-amber-500' : uploadedImageUrl ? 'bg-emerald-500' : 'bg-slate-600'} text-white text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1 shadow-xs`}>
+                      {isUploadingImage ? <RefreshCw className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                      <span>{isUploadingImage ? 'در حال ذخیره در سرور…' : uploadedImageUrl ? 'در پوشه سرور ذخیره شد' : 'تصویر انتخاب شد'}</span>
                     </div>
                   </div>
 
@@ -594,7 +634,11 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                       <button
                         type="button"
                         onClick={() => {
+                          imageUploadSequenceRef.current += 1;
+                          setIsUploadingImage(false);
+                          if (selectedImage?.startsWith('blob:')) URL.revokeObjectURL(selectedImage);
                           setSelectedImage(null);
+                          setUploadedImageUrl(null);
                           stopCamera();
                         }}
                         className="text-xs font-bold text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-lg transition-all cursor-pointer"
@@ -651,10 +695,11 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                     <button
                       type="button"
                       onClick={() => handleAnalyze('quick')}
-                      className="h-11 px-5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl text-xs font-bold shadow-md hover:shadow-lg transition-all flex items-center gap-2 cursor-pointer"
+                      disabled={isUploadingImage}
+                      className="h-11 px-5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl text-xs font-bold shadow-md hover:shadow-lg transition-all flex items-center gap-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                      <Sparkles className="w-4 h-4" />
-                      <span>شناسایی فوری فقط با تصویر</span>
+                      {isUploadingImage ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                      <span>{isUploadingImage ? 'در حال بارگذاری تصویر…' : 'شناسایی فوری فقط با تصویر'}</span>
                     </button>
                   )}
 
@@ -957,10 +1002,11 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                 <button
                   type="button"
                   onClick={() => handleAnalyze('refined')}
-                  className="h-11 px-7 bg-[#E06518] hover:bg-[#C95210] text-white rounded-xl text-xs sm:text-sm font-black shadow-md hover:shadow-lg transition-all flex items-center gap-2 cursor-pointer"
+                  disabled={isUploadingImage}
+                  className="h-11 px-7 bg-[#E06518] hover:bg-[#C95210] text-white rounded-xl text-xs sm:text-sm font-black shadow-md hover:shadow-lg transition-all flex items-center gap-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  <Sparkles className="w-4 h-4" />
-                  <span>{lastStage === 'quick' ? 'تحلیل دقیق نهایی با ابعاد' : 'تحلیل هوش مصنوعی و یافتن کالا'}</span>
+                  {isUploadingImage ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                  <span>{isUploadingImage ? 'در حال بارگذاری تصویر…' : lastStage === 'quick' ? 'تحلیل دقیق نهایی با ابعاد' : 'تحلیل هوش مصنوعی و یافتن کالا'}</span>
                 </button>
               </div>
             </motion.div>
