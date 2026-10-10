@@ -56,6 +56,7 @@ import {
   IndustrialPresetSample,
 } from '../services/aiVisualSearchService';
 import { useCart } from '../context/CartContext';
+import { AiVisualPartSearchModal } from '../components/search/AiVisualPartSearchModal';
 
 interface Message {
   id: string;
@@ -170,6 +171,7 @@ export const AiConsultPage: React.FC = () => {
   const [showCalculatorModal, setShowCalculatorModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [isDeeperResearchActive, setIsDeeperResearchActive] = useState(false);
+  const [isVisualSearchModalOpen, setIsVisualSearchModalOpen] = useState(false);
 
   // Settings State
   const [selectedIndustry, setSelectedIndustry] = useState('general');
@@ -1040,7 +1042,7 @@ export const AiConsultPage: React.FC = () => {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setActiveWorkspaceTab('visual_studio')}
+                  onClick={() => setIsVisualSearchModalOpen(true)}
                   className={`px-3 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
                     activeWorkspaceTab === 'visual_studio'
                       ? 'bg-[#FFFFFF] text-[#E06518] shadow-2xs'
@@ -1058,9 +1060,7 @@ export const AiConsultPage: React.FC = () => {
               {/* Toggle to Visual Studio on Mobile */}
               <button
                 type="button"
-                onClick={() =>
-                  setActiveWorkspaceTab(activeWorkspaceTab === 'chat' ? 'visual_studio' : 'chat')
-                }
+                onClick={() => setIsVisualSearchModalOpen(true)}
                 className="sm:hidden px-2.5 py-1.5 rounded-xl border border-[#CBD2D8] bg-[#FFFFFF] text-[#55565A] text-xs font-bold flex items-center gap-1"
               >
                 {activeWorkspaceTab === 'chat' ? (
@@ -2243,6 +2243,12 @@ export const AiConsultPage: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Visual Part Search Wizard Modal */}
+      <AiVisualPartSearchModal
+        isOpen={isVisualSearchModalOpen}
+        onClose={() => setIsVisualSearchModalOpen(false)}
+      />
     </div>
   );
 };

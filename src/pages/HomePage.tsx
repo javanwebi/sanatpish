@@ -1003,7 +1003,7 @@ export const HomePage: React.FC = () => {
                 <div className="pt-1">
                   <button
                     type="button"
-                    onClick={() => setIsConsultOpen(true)}
+                    onClick={() => navigate('/ai-consult')}
                     className="h-10 px-5 bg-white text-[#55565A] hover:bg-[#DEE2E5] border border-transparent hover:border-[#E06518] text-xs font-bold rounded-xl transition-all flex items-center gap-2 cursor-pointer shadow-sm group"
                   >
                     <span>شروع مشاوره آنلاین قطعه</span>
