@@ -1,5 +1,5 @@
 import { Product } from '../types';
-import { getProductByCode, generateMockProducts } from '../data/mockGenerator';
+import { getProductByCode } from '../data/mockGenerator';
 import { getProductImageUrl } from '../assets/imagesproducts';
 import { apiUrl, assertBackendConfigured } from '../config/apiConfig';
 
@@ -50,6 +50,10 @@ export interface MatchedPartItem {
   distinction?: string;
   specs: { key: string; value: string }[];
   catalogProduct?: Product;
+  // How the server found this real catalog record.
+  matchType?: 'visual' | 'technical' | 'combined' | 'code';
+  technicalMatchScore?: number;
+  technicalEvidence?: string[];
   // Direct image-to-image match against the site's catalog photos
   isVisualMatch?: boolean;
   visualDistance?: number;
@@ -79,13 +83,15 @@ export interface AiPartAnalysisResult {
     boundingBox?: BoundingBox;
     exactVisualMatch?: boolean;
     catalogAvailability?: CatalogAvailability;
-    verifiedCandidateCount?: number;
+    verifiedCandidateCount?: number; // Legacy count alias; results are ranked, not independently verified by Gemini.
   };
   matchedProducts: MatchedPartItem[];
   rejectedCandidates?: MatchedPartItem[]; // (legacy, kept empty) items rejected as 'different'
-  similarCandidates?: MatchedPartItem[]; // visually close alternatives — NOT the exact part
+  similarCandidates?: MatchedPartItem[]; // server-ranked real catalog alternatives from visual and/or technical search
   technicalAdvice: string;
   fallbackNotice?: string;
+  catalogSearchWarning?: string;
+  customerImageUrl?: string;
   aiError?: string;
 }
 
@@ -238,22 +244,12 @@ export const aiVisualSearchService = {
 
     const data: AiPartAnalysisResult = await response.json();
 
-    // Enrich matched products with full catalog objects
-    const allProducts = generateMockProducts();
-
-    const mapWithCatalog = (m: MatchedPartItem): MatchedPartItem => {
-      let catalogItem = getProductByCode(m.code);
-      if (!catalogItem) {
-        // Find by partial code or name
-        catalogItem = allProducts.find(
-          p => p.code.toLowerCase() === m.code.toLowerCase() || p.name.includes(m.name)
-        );
-      }
-      return {
-        ...m,
-        catalogProduct: catalogItem,
-      };
-    };
+    // Enrich only by the exact product code. Never invent a catalog result
+    // through a partial name match or generated fallback product.
+    const mapWithCatalog = (m: MatchedPartItem): MatchedPartItem => ({
+      ...m,
+      catalogProduct: getProductByCode(m.code),
+    });
 
     data.matchedProducts = (data.matchedProducts || []).map(mapWithCatalog);
     if (data.rejectedCandidates && Array.isArray(data.rejectedCandidates)) {

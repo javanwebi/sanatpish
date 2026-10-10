@@ -1669,42 +1669,31 @@ function rankByVisualFeatures(
     colDistance: Number(s.colDistance.toFixed(4)),
   }));
 
-  // Deduplicate by image so candidates represent distinct catalog photos.
-  // The deep-embedding path is included because it recognizes the same part
-  // under very different lighting/scene conditions where hashes fail.
-  const seenImages = new Set<string>();
-  const distinctCandidates: typeof scored = [];
-  for (const s of byCombined.slice(0, Math.min(8, topK))) {
-    const img = (s.item.image || '').trim();
-    if (!seenImages.has(img)) {
-      seenImages.add(img);
-      distinctCandidates.push(s);
+  // Union recall from independent visual channels and deduplicate by catalog
+  // product code (not image path): separate products may intentionally share a photo.
+  const visualSources = [byCombined, byEmb, byCol, byRaw];
+  const candidateByCode = new Map<string, (typeof scored)[number]>();
+  for (let rank = 0; rank < topK; rank += 1) {
+    for (const source of visualSources) {
+      const candidate = source[rank];
+      if (!candidate) continue;
+      const key = String(candidate.item.code || candidate.item.image || '').trim().toLowerCase();
+      if (key && !candidateByCode.has(key)) candidateByCode.set(key, candidate);
     }
   }
-  for (const s of byEmb.slice(0, 8)) {
-    if (distinctCandidates.length >= topK) break;
-    const img = (s.item.image || '').trim();
-    if (!seenImages.has(img)) {
-      seenImages.add(img);
-      distinctCandidates.push(s);
+  const retrievalDistance = (candidate: (typeof scored)[number]) => {
+    const hashDistance = Number.isFinite(candidate.distance)
+      ? Math.max(0, Math.min(1, candidate.distance))
+      : 1;
+    if (candidate.embSim >= 0) {
+      const embeddingDistance = Math.max(0, Math.min(1, 1 - candidate.embSim));
+      return 0.65 * embeddingDistance + 0.35 * hashDistance;
     }
-  }
-  for (const s of byCol.slice(0, 6)) {
-    if (distinctCandidates.length >= topK) break;
-    const img = (s.item.image || '').trim();
-    if (!seenImages.has(img)) {
-      seenImages.add(img);
-      distinctCandidates.push(s);
-    }
-  }
-  for (const s of byRaw.slice(0, 6)) {
-    if (distinctCandidates.length >= topK) break;
-    const img = (s.item.image || '').trim();
-    if (!seenImages.has(img)) {
-      seenImages.add(img);
-      distinctCandidates.push(s);
-    }
-  }
+    return hashDistance;
+  };
+  const distinctCandidates = [...candidateByCode.values()]
+    .sort((a, b) => retrievalDistance(a) - retrievalDistance(b))
+    .slice(0, topK);
 
   const exactVisualMatch = minDistance <= VISUAL_DUPLICATE_MAX;
 
@@ -1718,7 +1707,14 @@ function rankByVisualFeatures(
     subcategory: item.subcategory,
     cataloguePage: item.page,
     image: item.image,
-    similarityScore: distance <= VISUAL_DUPLICATE_MAX ? 99 : Math.max(55, Math.min(92, Math.round(99 - distance * 55))),
+    similarityScore: distance <= VISUAL_DUPLICATE_MAX
+      ? 99
+      : embSim >= 0
+        ? Math.max(55, Math.min(96, Math.round(
+            0.65 * Math.max(55, Math.min(92, 99 - Math.min(distance, 1) * 55)) +
+            0.35 * Math.max(0, Math.min(100, embSim * 100))
+          )))
+        : Math.max(55, Math.min(92, Math.round(99 - Math.min(distance, 1) * 55))),
     matchReason:
       distance <= VISUAL_DUPLICATE_MAX
         ? '🎯 عکس شما عیناً همان تصویر این کالا در کاتالوگ اطلس است'
@@ -1757,7 +1753,8 @@ async function cropToBoundingBox(buffer: Buffer, bb: NormBox, padRatio = 0.08): 
 async function getVisualCandidateResult(
   queryBuffer: Buffer,
   boundingBox?: NormBox,
-  includeDeepEmbeddings = true
+  includeDeepEmbeddings = true,
+  topK = 14
 ): Promise<VisualCandidateResult> {
   if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
     return { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
@@ -1796,7 +1793,7 @@ async function getVisualCandidateResult(
       console.log('[Visual Retrieval] Jina query embedding failed (hash-only):', err?.message?.slice(0, 80));
     }
   }
-  return rankByVisualFeatures(dualList, queryEmbs);
+  return rankByVisualFeatures(dualList, queryEmbs, topK);
 }
 
 // Normalize any image input (data-URL, raw base64, or remote http URL) into
@@ -2612,8 +2609,7 @@ function getUploadedCustomerImageFromUrl(
     url.search ||
     url.hash ||
     url.username ||
-    url.password ||
-    url.port
+    url.password
   ) {
     throw new Error('آدرس تصویر باید از همین سرور و پوشه imagemoshtari باشد.');
   }
@@ -2645,7 +2641,7 @@ async function callPartRecognitionWorker(
   prompt: string
 ): Promise<any> {
   const workerUrl = `${getPartRecognitionWorkerUrl()}/v1/chat/completions`;
-  const configuredTimeout = Number(process.env.PART_RECOGNITION_WORKER_TIMEOUT_MS || 12_000);
+  const configuredTimeout = Number(process.env.PART_RECOGNITION_WORKER_TIMEOUT_MS || 25_000);
   const timeoutMs = Number.isFinite(configuredTimeout)
     ? Math.max(3_000, Math.min(configuredTimeout, 30_000))
     : 12_000;
@@ -2655,7 +2651,9 @@ async function callPartRecognitionWorker(
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const sharedToken = (process.env.PART_RECOGNITION_WORKER_TOKEN || '').trim();
-    if (sharedToken) headers.Authorization = `Bearer ${sharedToken}`;
+    if (sharedToken && !PLACEHOLDER_KEYS.has(sharedToken)) {
+      headers.Authorization = `Bearer ${sharedToken}`;
+    }
     const geminiKey = getGeminiKey();
     if (geminiKey) headers['X-Gemini-Key'] = geminiKey;
 
@@ -2715,36 +2713,463 @@ function buildWorkerAnalysisPrompt(body: any, stage: 'quick' | 'refined'): strin
     .join('\n');
 }
 
-function mapWorkerVisualCandidate(candidate: any, exact: boolean): any {
-  const distance = Number(candidate?.visualDistance);
-  const similarity = exact
-    ? 99
-    : Math.max(55, Math.min(92, Number(candidate?.similarityScore) || Math.round(99 - distance * 55)));
-  const name = String(candidate?.name || candidate?.categoryName || 'قطعه صنعتی مشابه');
+const CATALOG_VISUAL_CANDIDATE_LIMIT = 40;
+const CATALOG_TECHNICAL_CANDIDATE_LIMIT = 25;
+const CATALOG_SIMILAR_RESULT_LIMIT = 12;
+const CATALOG_SIMILAR_MAX_DISTANCE = 0.34;
+
+function normalizeCatalogSearchText(value: unknown): string {
+  const persianDigits = '۰۱۲۳۴۵۶۷۸۹';
+  const arabicDigits = '٠١٢٣٤٥٦٧٨٩';
+  return String(value ?? '')
+    .normalize('NFKC')
+    .replace(/[يى]/g, 'ی')
+    .replace(/ك/g, 'ک')
+    .replace(/[۰-۹]/g, (digit) => String(persianDigits.indexOf(digit)))
+    .replace(/[٠-٩]/g, (digit) => String(arabicDigits.indexOf(digit)))
+    .replace(/[\u200c\u200d]/g, ' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0600-\u06ff]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+const CATALOG_SEARCH_STOPWORDS = new Set([
+  'و', 'در', 'از', 'با', 'برای', 'به', 'این', 'آن', 'یک', 'که', 'را', 'روی',
+  'تصویر', 'عکس', 'قطعه', 'صنعتی', 'کالا', 'محصول', 'مشخصات', 'اعلامی', 'مشتری',
+  'بررسی', 'تحلیل', 'مدل', 'نوع', 'دقیق', 'سریع', 'مرحله', 'موجود', 'است', 'می',
+  'the', 'and', 'for', 'with', 'part', 'product', 'image', 'customer', 'industrial',
+]);
+
+function catalogSearchTokens(value: unknown): string[] {
+  return normalizeCatalogSearchText(value)
+    .split(' ')
+    .filter((token) => token.length >= 2 && !CATALOG_SEARCH_STOPWORDS.has(token));
+}
+
+function normalizedCode(value: unknown): string {
+  return normalizeCatalogSearchText(value).replace(/\s+/g, '');
+}
+
+function confidenceAsPercent(value: unknown): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return 0;
+  const percent = raw > 0 && raw <= 1 ? raw * 100 : raw;
+  return Math.max(0, Math.min(100, percent));
+}
+
+function weightedRecognitionTokens(recognition: any, prompt: string): Map<string, number> {
+  const fields: Array<[unknown, number]> = [
+    [recognition?.detected_code_on_part, 4.5],
+    [recognition?.product_code, 4],
+    [recognition?.profile_or_standard, 2.8],
+    [recognition?.model, 2.5],
+    [recognition?.brand, 1.8],
+    [recognition?.size, 1.8],
+    [recognition?.product_name, 2.2],
+    [recognition?.detected_part_type, 2.2],
+    [recognition?.type, 1.8],
+    [recognition?.visual_shape, 1.8],
+    [recognition?.category, 1.4],
+    [recognition?.material, 1.4],
+    [recognition?.technical_features, 1.6],
+    [recognition?.visual_features, 1.4],
+    [recognition?.object_color, 0.6],
+    [prompt, 0.25],
+  ];
+  const weights = new Map<string, number>();
+  for (const [value, weight] of fields) {
+    const entries = Array.isArray(value) ? value : [value];
+    for (const entry of entries) {
+      for (const token of catalogSearchTokens(entry)) {
+        weights.set(token, Math.max(weights.get(token) || 0, weight));
+      }
+    }
+  }
+  return weights;
+}
+
+function parseDeclaredDimensions(prompt: string): number[] {
+  const text = normalizeCatalogSearchText(prompt);
+  const patterns = [
+    /طول اعلامی\s+(\d+(?:\.\d+)?)/,
+    /عرض اعلامی\s+(\d+(?:\.\d+)?)/,
+    /گام یا ضخامت اعلامی\s+(\d+(?:\.\d+)?)/,
+  ];
+  return patterns
+    .map((pattern) => text.match(pattern)?.[1])
+    .filter((value): value is string => Boolean(value))
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function catalogItemText(item: CatalogItem): string {
+  const relevantSpecs = (Array.isArray(item.specs) ? item.specs : [])
+    .filter((spec) => !/صفحه|page/i.test(String(spec?.key || '')))
+    .flatMap((spec) => [spec?.key, spec?.value]);
+  return normalizeCatalogSearchText([
+    item.code,
+    item.forzaCode,
+    item.name,
+    item.categoryName,
+    item.subcategory,
+    ...relevantSpecs,
+  ].join(' '));
+}
+
+function catalogItemCodeFields(item: CatalogItem): string[] {
+  return [
+    item.code,
+    item.forzaCode,
+    ...(Array.isArray(item.specs)
+      ? item.specs.filter((spec) => /کد|code|forza/i.test(String(spec?.key || ''))).map((spec) => spec?.value)
+      : []),
+  ].map(normalizedCode).filter(Boolean);
+}
+
+function catalogBrandFromRecord(item: CatalogItem): string {
+  const brandSpec = (Array.isArray(item.specs) ? item.specs : [])
+    .find((spec) => /برند|سازنده|manufacturer|brand/i.test(String(spec?.key || '')));
+  return String(brandSpec?.value || '').trim();
+}
+
+function catalogDimensionNumbers(item: CatalogItem): number[] {
+  const specs = (Array.isArray(item.specs) ? item.specs : []).filter((spec) => {
+    const key = normalizeCatalogSearchText(spec?.key || '');
+    return !/صفحه|page/.test(key) && /طول|عرض|گام|ضخامت|قطر|ابعاد|سایز|length|width|pitch|thickness|diameter|dimension/.test(key);
+  });
+  const numbers: number[] = [];
+  for (const spec of specs) {
+    const value = normalizeCatalogSearchText(spec?.value || '');
+    for (const match of value.matchAll(/\d+(?:\.\d+)?/g)) {
+      const number = Number(match[0]);
+      if (Number.isFinite(number) && number > 0) numbers.push(number);
+    }
+  }
+  return numbers;
+}
+
+function scoreCatalogTechnicalMatch(
+  item: CatalogItem,
+  recognition: any,
+  prompt: string,
+  queryWeights: Map<string, number>,
+  declaredDimensions: number[]
+): { score: number; exactCode: boolean; matchedTokens: string[]; dimensionScore: number } {
+  const itemText = catalogItemText(item);
+  const itemTokens = new Set(catalogSearchTokens(itemText));
+  const matchedTokens = [...queryWeights.keys()].filter((token) => itemTokens.has(token));
+  const totalWeight = [...queryWeights.values()].reduce((sum, weight) => sum + weight, 0);
+  const matchedWeight = matchedTokens.reduce((sum, token) => sum + (queryWeights.get(token) || 0), 0);
+  const tokenCoverage = totalWeight > 0 ? (matchedWeight / totalWeight) * 100 : 0;
+
+  const phraseValues = [recognition?.product_name, recognition?.detected_part_type, recognition?.type, recognition?.profile_or_standard]
+    .map(normalizeCatalogSearchText)
+    .filter((phrase) => phrase.length >= 5);
+  const phraseMatch = phraseValues.some((phrase) => itemText.includes(phrase));
+
+  const codeConfidence = confidenceAsPercent(recognition?.code_read_confidence);
+  // Only a high-confidence code explicitly read from the image may be exact.
+  // A model-suggested product_code contributes to technical ranking, not proof.
+  const detectedCode = typeof recognition?.detected_code_on_part === 'string'
+    ? recognition.detected_code_on_part
+    : '';
+  const itemCodes = catalogItemCodeFields(item);
+  const code = normalizedCode(detectedCode);
+  const exactCode = codeConfidence >= 90 && code.length >= 4 &&
+    itemCodes.some((catalogCode) => catalogCode.includes(code));
+
+  let dimensionScore = 0;
+  if (declaredDimensions.length > 0) {
+    const catalogDimensions = catalogDimensionNumbers(item);
+    if (catalogDimensions.length > 0) {
+      const matchedDimensions = declaredDimensions.filter((requested) =>
+        catalogDimensions.some((available) => Math.abs(available - requested) <= Math.max(0.5, requested * 0.03))
+      ).length;
+      dimensionScore = (matchedDimensions / declaredDimensions.length) * 100;
+    }
+  }
+
+  let score = Math.min(100, tokenCoverage * 0.82 + (phraseMatch ? 12 : 0));
+  if (dimensionScore > 0) score = score * 0.8 + dimensionScore * 0.2;
+  if (exactCode) score = 100;
+
   return {
-    code: String(candidate?.code || ''),
-    name,
-    brand: String(candidate?.brand || ''),
-    type: String(candidate?.categoryName || candidate?.subcategory || ''),
-    similarityScore: similarity,
-    matchReason: exact
-      ? 'تصویر ارسالی با تصویر مرجع این کالا در کاتالوگ اطلس تطبیق تصویری مستقیم دارد.'
-      : 'این مورد بر اساس ویژگی‌های ظاهری، یکی از نزدیک‌ترین تصاویر کاتالوگ است؛ تطبیق قطعی فقط با بررسی ابعاد و مشخصات فنی انجام می‌شود.',
-    distinction: exact
-      ? 'تطبیق مستقیم تصویر با مرجع کاتالوگ.'
-      : 'شباهت ظاهری به معنی یکسان بودن کد فنی یا سازگاری قطعی نیست.',
-    specs: Array.isArray(candidate?.specs) ? candidate.specs : [],
-    isVisualMatch: true,
-    visualDistance: Number.isFinite(distance) ? distance : undefined,
-    visualVerdict: exact ? 'exact_match' : 'very_similar',
-    visualVerdictFarsi: exact ? 'همونه (تطبیق تصویری مستقیم)' : 'شبیهه (نیازمند بررسی مشخصات)',
-    visualExplanation: exact
-      ? 'ویژگی‌های تصویر با عکس مرجع کاتالوگ بسیار نزدیک و در حد آستانه تطبیق مستقیم است.'
-      : 'شباهت بر اساس نمای ظاهری و ویژگی‌های تصویر محاسبه شده است؛ پیش از سفارش، ابعاد و کد فنی بررسی شود.',
-    forzaCode: candidate?.forzaCode,
-    cataloguePage: candidate?.cataloguePage,
-    image: candidate?.image,
+    score: Math.round(Math.max(0, Math.min(100, score))),
+    exactCode,
+    matchedTokens: matchedTokens.slice(0, 10),
+    dimensionScore: Math.round(dimensionScore),
   };
+}
+
+function buildCatalogSearchMatch(
+  item: CatalogItem,
+  visualCandidate: any | undefined,
+  technical: { score: number; exactCode: boolean; matchedTokens: string[]; dimensionScore: number }
+): any {
+  const distance = Number(visualCandidate?.visualDistance);
+  const hasVisualEvidence = Boolean(visualCandidate && Number.isFinite(distance) && distance <= CATALOG_SIMILAR_MAX_DISTANCE);
+  const exactVisual = Boolean(hasVisualEvidence && distance <= VISUAL_DUPLICATE_MAX);
+  const exact = exactVisual || technical.exactCode;
+  const visualScore = hasVisualEvidence
+    ? Number(visualCandidate?.similarityScore) || Math.max(0, Math.round(100 - Math.min(distance, 1) * 100))
+    : 0;
+  const overallScore = exact
+    ? 99
+    : hasVisualEvidence && technical.score > 0
+      ? Math.round(visualScore * 0.75 + technical.score * 0.25)
+      : hasVisualEvidence
+        ? visualScore
+        : technical.score;
+
+  const evidence: string[] = [];
+  if (exactVisual) evidence.push('تصویر با عکس مرجع کاتالوگ در آستانهٔ تطبیق مستقیم قرار دارد');
+  else if (hasVisualEvidence) evidence.push(`شباهت تصویری سرور (فاصله ${distance.toFixed(3)})`);
+  if (technical.exactCode) evidence.push('کد خوانده‌شده با کد واقعی کاتالوگ تطبیق دارد');
+  else if (technical.matchedTokens.length > 0) evidence.push(`ویژگی‌های منطبق در اطلاعات واقعی کاتالوگ: ${technical.matchedTokens.join('، ')}`);
+  if (technical.dimensionScore > 0) evidence.push(`انطباق ابعادی متنی: ${technical.dimensionScore}٪`);
+
+  const matchType = technical.exactCode
+    ? (hasVisualEvidence ? 'combined' : 'code')
+    : hasVisualEvidence && technical.matchedTokens.length > 0
+      ? 'combined'
+      : hasVisualEvidence
+        ? 'visual'
+        : 'technical';
+  const exactReason = technical.exactCode
+    ? 'کدی که از تصویر خوانده شده با کد همین محصول در کاتالوگ تطبیق دارد.'
+    : 'ویژگی‌های تصویر با عکس مرجع همین محصول در کاتالوگ تطبیق مستقیم دارد.';
+  const similarReason = evidence.length > 0
+    ? evidence.join('؛ ')
+    : 'این محصول از داده‌های واقعی کاتالوگ برای بررسی بیشتر بازیابی شده است.';
+
+  return {
+    code: item.code,
+    name: item.name,
+    brand: catalogBrandFromRecord(item),
+    type: item.categoryName || item.subcategory || '',
+    similarityScore: overallScore,
+    matchReason: exact ? exactReason : similarReason,
+    distinction: exact
+      ? 'تطبیق کد یا تصویر، به‌تنهایی جایگزین بررسی کامل مشخصات فنی و سازگاری با دستگاه نیست.'
+      : 'این نتیجهٔ رتبه‌بندی است؛ شباهت ظاهری یا واژگانی به‌تنهایی سازگاری فنی را ثابت نمی‌کند.',
+    specs: Array.isArray(item.specs) ? item.specs : [],
+    isVisualMatch: hasVisualEvidence,
+    matchType,
+    visualDistance: hasVisualEvidence ? distance : undefined,
+    visualVerdict: hasVisualEvidence ? (exactVisual ? 'exact_match' : 'very_similar') : undefined,
+    visualVerdictFarsi: hasVisualEvidence
+      ? (exactVisual ? 'تطبیق تصویری بسیار نزدیک' : 'نامزد مشابه تصویری')
+      : (technical.exactCode ? 'کد کاتالوگ منطبق' : 'تطبیق فنی/متنی'),
+    visualExplanation: similarReason,
+    technicalMatchScore: technical.score,
+    technicalEvidence: evidence,
+    forzaCode: item.forzaCode || undefined,
+    cataloguePage: item.page,
+    image: item.image || undefined,
+  };
+}
+
+async function searchCatalogProducts(
+  imageBuffer: Buffer,
+  recognition: any,
+  prompt: string
+): Promise<{ matchedProducts: any[]; similarCandidates: any[]; exactVisualMatch: boolean; visualCandidateCount: number }> {
+  const visualResult = await getVisualCandidateResult(
+    imageBuffer,
+    undefined,
+    false,
+    CATALOG_VISUAL_CANDIDATE_LIMIT
+  );
+  const visualByCode = new Map<string, any>();
+  for (const candidate of visualResult.candidates || []) {
+    const key = String(candidate.code || '').trim().toLowerCase();
+    if (key) visualByCode.set(key, candidate);
+  }
+
+  const queryWeights = weightedRecognitionTokens(recognition, prompt);
+  const declaredDimensions = parseDeclaredDimensions(prompt);
+  const technicalRanked = CATALOG_ITEMS
+    .map((item) => ({
+      item,
+      technical: scoreCatalogTechnicalMatch(item, recognition, prompt, queryWeights, declaredDimensions),
+    }))
+    .filter(({ technical }) =>
+      technical.exactCode ||
+      (technical.matchedTokens.length >= 2 && technical.score >= 24) ||
+      (technical.matchedTokens.length >= 1 && technical.score >= 34 && technical.dimensionScore >= 70)
+    )
+    .sort((a, b) => b.technical.score - a.technical.score)
+    .slice(0, CATALOG_TECHNICAL_CANDIDATE_LIMIT);
+
+  const candidateByCode = new Map<string, { item: CatalogItem; visual?: any; technical: ReturnType<typeof scoreCatalogTechnicalMatch> }>();
+  const addCandidate = (item: CatalogItem, visual: any | undefined, technical: ReturnType<typeof scoreCatalogTechnicalMatch>) => {
+    const key = String(item.code || '').trim().toLowerCase();
+    if (key) candidateByCode.set(key, { item, visual, technical });
+  };
+
+  for (const [code, visual] of visualByCode) {
+    const item = CATALOG_ITEMS.find((catalogItem) => String(catalogItem.code || '').trim().toLowerCase() === code);
+    if (!item) continue;
+    const technical = scoreCatalogTechnicalMatch(item, recognition, prompt, queryWeights, declaredDimensions);
+    const distance = Number(visual.visualDistance);
+    if (distance <= CATALOG_SIMILAR_MAX_DISTANCE || (typeof visual.embSim === 'number' && visual.embSim >= 0.9)) {
+      addCandidate(item, visual, technical);
+    }
+  }
+  for (const { item, technical } of technicalRanked) {
+    addCandidate(item, visualByCode.get(String(item.code || '').trim().toLowerCase()), technical);
+  }
+
+  const mapped = [...candidateByCode.values()]
+    .map(({ item, visual, technical }) => ({
+      item,
+      visual,
+      technical,
+      result: buildCatalogSearchMatch(item, visual, technical),
+      exact: Boolean(technical.exactCode || (visual && Number(visual.visualDistance) <= VISUAL_DUPLICATE_MAX)),
+    }))
+    .sort((a, b) => b.result.similarityScore - a.result.similarityScore);
+
+  const matchedProducts = mapped.filter((entry) => entry.exact).map((entry) => entry.result);
+  const similarCandidates = mapped
+    .filter((entry) => !entry.exact)
+    .slice(0, CATALOG_SIMILAR_RESULT_LIMIT)
+    .map((entry) => entry.result);
+  return {
+    matchedProducts,
+    similarCandidates,
+    exactVisualMatch: mapped.some((entry) => Boolean(entry.visual && Number(entry.visual.visualDistance) <= VISUAL_DUPLICATE_MAX)),
+    visualCandidateCount: visualByCode.size,
+  };
+}
+
+function sanitizeRecognitionForCatalogSearch(value: any): Record<string, unknown> {
+  const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const textFields = [
+    'product_name', 'detected_part_type', 'type', 'category', 'visual_shape', 'object_color',
+    'brand', 'model', 'product_code', 'detected_code_on_part', 'profile_or_standard', 'size', 'material',
+  ];
+  const result: Record<string, unknown> = {};
+  for (const field of textFields) {
+    const text = String(input[field] ?? '').replace(/[\u0000-\u001f]+/g, ' ').trim().slice(0, 240);
+    if (text) result[field] = text;
+  }
+  for (const field of ['technical_features', 'visual_features']) {
+    const values = Array.isArray(input[field]) ? input[field] : [];
+    result[field] = values
+      .slice(0, 16)
+      .map((entry: unknown) => String(entry ?? '').replace(/[\u0000-\u001f]+/g, ' ').trim().slice(0, 180))
+      .filter(Boolean);
+  }
+  for (const field of ['confidence', 'code_read_confidence']) {
+    const score = Number(input[field]);
+    if (Number.isFinite(score)) result[field] = Math.max(0, Math.min(100, score));
+  }
+  return result;
+}
+
+function workerCatalogAuthStatus(req: express.Request): 'ok' | 'missing' | 'invalid' {
+  const expectedToken = String(process.env.PART_RECOGNITION_WORKER_TOKEN || '').trim();
+  if (!expectedToken || PLACEHOLDER_KEYS.has(expectedToken)) return 'missing';
+
+  const expected = Buffer.from(`Bearer ${expectedToken}`);
+  const provided = Buffer.from(String(req.get('authorization') || ''));
+  if (expected.length !== provided.length) return 'invalid';
+  return crypto.timingSafeEqual(expected, provided) ? 'ok' : 'invalid';
+}
+
+// Internal Worker -> app API. The Worker sends only the uploaded image URL,
+// extracted attributes and prompt; the server owns the catalog and searches it.
+app.post('/api/ai/part-catalog-search', async (req, res) => {
+  const authStatus = workerCatalogAuthStatus(req);
+  if (authStatus !== 'ok') {
+    return res.status(authStatus === 'missing' ? 503 : 401).json({
+      success: false,
+      error: {
+        type: authStatus === 'missing' ? 'worker_token_not_configured' : 'unauthorized',
+        message: authStatus === 'missing'
+          ? 'PART_RECOGNITION_WORKER_TOKEN را در سرور تنظیم کنید تا Worker به جست‌وجوی کاتالوگ دسترسی داشته باشد.'
+          : 'درخواست جست‌وجوی کاتالوگ از Worker مجاز نیست.',
+      },
+    });
+  }
+
+  try {
+    if (!Array.isArray(CATALOG_ITEMS) || CATALOG_ITEMS.length === 0) {
+      return res.status(503).json({
+        success: false,
+        error: { type: 'catalog_unavailable', message: 'کاتالوگ واقعی روی سرور بارگذاری نشده است.' },
+      });
+    }
+
+    const imageUrl = String(req.body?.image_url || '').trim();
+    const fileName = String(req.body?.file_name || '').trim();
+    const prompt = String(req.body?.prompt || '').trim().slice(0, 5000);
+    const recognition = sanitizeRecognitionForCatalogSearch(req.body?.recognition);
+    if (!imageUrl || !fileName) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'missing_image_fields', message: 'فیلدهای image_url و file_name الزامی هستند.' },
+      });
+    }
+
+    const uploaded = getUploadedCustomerImageFromUrl(imageUrl, req);
+    if (uploaded.fileName !== fileName) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'image_file_mismatch', message: 'نام فایل با تصویر ذخیره‌شده مطابقت ندارد.' },
+      });
+    }
+
+    const results = await searchCatalogProducts(uploaded.buffer, recognition, prompt);
+    return res.json({
+      success: true,
+      catalogItemCount: CATALOG_ITEMS.length,
+      visualIndexReady,
+      ...results,
+    });
+  } catch (error: any) {
+    console.warn('[Worker Catalog Search] Request failed:', error?.message || 'catalog search error');
+    return res.status(400).json({
+      success: false,
+      error: { type: 'catalog_search_failed', message: error?.message || 'جست‌وجوی کاتالوگ ناموفق بود.' },
+    });
+  }
+});
+
+function canonicalizeCatalogSearchMatch(candidate: any): any | null {
+  const item = catalogItemByCodeRef(String(candidate?.code || ''));
+  if (!item) return null;
+
+  // Product identity and technical specs always come from the server catalog,
+  // never from Gemini or Worker-generated text.
+  return {
+    ...candidate,
+    code: item.code,
+    name: item.name,
+    brand: catalogBrandFromRecord(item),
+    type: item.categoryName || item.subcategory || '',
+    specs: Array.isArray(item.specs) ? item.specs : [],
+    forzaCode: item.forzaCode || undefined,
+    cataloguePage: item.page,
+    image: item.image || undefined,
+  };
+}
+
+function canonicalizeCatalogMatchList(values: unknown): any[] {
+  if (!Array.isArray(values)) return [];
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const value of values) {
+    const canonical = canonicalizeCatalogSearchMatch(value);
+    if (!canonical) continue;
+    const key = String(canonical.code).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(canonical);
+  }
+  return out;
 }
 
 async function analyzePartWithWorker(
@@ -2753,71 +3178,76 @@ async function analyzePartWithWorker(
   stage: 'quick' | 'refined'
 ): Promise<any> {
   const uploaded = getUploadedCustomerImageFromUrl(String(body?.imageUrl || '').trim(), req);
-  const normalizedForSearch = await sharp(uploaded.buffer)
-    .resize(480, 480, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 82 })
-    .toBuffer();
-
-  // Run the Worker recognition and the local catalog image retrieval concurrently.
-  // The local engine provides catalog matches; the Worker provides the AI description.
-  const [workerData, visualResult] = await Promise.all([
-    callPartRecognitionWorker(
-      uploaded.imageUrl,
-      uploaded.fileName,
-      buildWorkerAnalysisPrompt(body, stage)
-    ),
-    getVisualCandidateResult(normalizedForSearch, undefined, false),
-  ]);
+  const prompt = buildWorkerAnalysisPrompt(body, stage);
+  const workerData = await callPartRecognitionWorker(uploaded.imageUrl, uploaded.fileName, prompt);
 
   const raw = workerData?.recognition && typeof workerData.recognition === 'object'
     ? workerData.recognition
     : null;
-  const exactRaw = (visualResult.candidates || []).filter(
-    (candidate: any) => Number(candidate.visualDistance) <= VISUAL_DUPLICATE_MAX
-  );
-  const similarRaw = (visualResult.candidates || [])
-    .filter((candidate: any) => {
-      const distance = Number(candidate.visualDistance);
-      return distance > VISUAL_DUPLICATE_MAX &&
-        (distance <= 0.34 || (typeof candidate.embSim === 'number' && candidate.embSim >= 0.9));
-    })
-    .slice(0, 4);
 
-  const exactMatches = exactRaw.slice(0, 4).map((candidate: any) => mapWorkerVisualCandidate(candidate, true));
-  const similarCandidates = similarRaw.map((candidate: any) => mapWorkerVisualCandidate(candidate, false));
-  const hasExact = exactMatches.length > 0;
+  let catalogSearch = workerData?.catalogSearch && typeof workerData.catalogSearch === 'object'
+    ? workerData.catalogSearch
+    : null;
+  let catalogSearchWarning = '';
+
+  // Compatibility/fail-safe path: if an older Worker is still deployed or its
+  // server catalog API is unreachable, the app server runs the same local search.
+  if (catalogSearch?.success !== true) {
+    try {
+      const localResults = await searchCatalogProducts(uploaded.buffer, raw || {}, prompt);
+      catalogSearch = { success: true, ...localResults };
+      catalogSearchWarning = String(
+        workerData?.catalogSearch?.error?.message ||
+        'جست‌وجوی کاتالوگ از مسیر Worker انجام نشد؛ نتیجه با موتور محلی سرور بازیابی شد.'
+      );
+    } catch (error: any) {
+      catalogSearch = { success: false, matchedProducts: [], similarCandidates: [], exactVisualMatch: false };
+      catalogSearchWarning = error?.message || 'جست‌وجوی کاتالوگ سرور در دسترس نبود.';
+    }
+  }
+
+  const exactMatches = canonicalizeCatalogMatchList(catalogSearch?.matchedProducts);
+  const similarCandidates = canonicalizeCatalogMatchList(catalogSearch?.similarCandidates)
+    .filter((candidate) => !exactMatches.some((exact) => exact.code === candidate.code));
+  const hasExactProduct = exactMatches.length > 0;
+  const exactVisualMatch = Boolean(catalogSearch?.exactVisualMatch);
   const isAiRecognized = Boolean(workerData?.success && raw && raw.is_recognizable !== false);
-  const confidenceValue = Number(raw?.confidence);
-  const aiConfidence = Number.isFinite(confidenceValue)
-    ? Math.max(0, Math.min(100, confidenceValue <= 1 ? confidenceValue * 100 : confidenceValue))
-    : 0;
-  const detectedType = String(
-    raw?.product_name || raw?.type || raw?.category || (hasExact ? exactMatches[0].name : '') || 'قطعه صنعتی قابل بررسی'
-  );
-  const profileParts = [raw?.brand, raw?.model, raw?.product_code, raw?.size]
-    .filter((value) => typeof value === 'string' && value.trim())
-    .map((value) => String(value).trim());
+  const aiConfidence = confidenceAsPercent(raw?.confidence);
   const visualFeatures = Array.isArray(raw?.visual_features)
     ? raw.visual_features.filter((value: unknown) => typeof value === 'string' && value.trim()).slice(0, 8)
     : [];
-  const isRecognizable = isAiRecognized || hasExact;
+  const detectedType = String(
+    raw?.detected_part_type || raw?.product_name || raw?.type || raw?.category ||
+    (hasExactProduct ? exactMatches[0].name : '') || 'قطعه صنعتی قابل بررسی'
+  );
+  const profileParts = [
+    raw?.profile_or_standard,
+    raw?.model,
+    raw?.product_code,
+    raw?.detected_code_on_part,
+    raw?.size,
+    raw?.material,
+  ]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => String(value).trim());
+  const isRecognizable = isAiRecognized || hasExactProduct || similarCandidates.length > 0;
 
-  const catalogAvailability = hasExact
+  const catalogAvailability = hasExactProduct
     ? {
         status: 'confirmed_in_catalog',
-        statusFarsiTitle: 'تطبیق تصویری مستقیم با کالا در کاتالوگ پیدا شد',
-        statusFarsiMessage: 'تصویر ارسالی با تصویر مرجع یکی از کالاهای کاتالوگ تطبیق مستقیم دارد؛ کد و ابعاد کالا را پیش از سفارش بررسی کنید.',
+        statusFarsiTitle: 'محصول واقعی با کد یا تصویر منطبق در کاتالوگ پیدا شد',
+        statusFarsiMessage: 'نام، کد و مشخصات نمایش‌داده‌شده از رکورد واقعی کاتالوگ سرور آمده‌اند؛ پیش از سفارش سازگاری ابعادی را بررسی کنید.',
       }
     : similarCandidates.length > 0
       ? {
           status: 'similar_in_catalog',
-          statusFarsiTitle: 'چند مدل از نظر ظاهر به تصویر شما نزدیک‌اند',
-          statusFarsiMessage: 'این موارد بر اساس شکل و ویژگی‌های ظاهری پیشنهاد شده‌اند؛ مشابهت تصویری، تطبیق فنی یا یکسان بودن قطعه را تضمین نمی‌کند.',
+          statusFarsiTitle: 'محصولات واقعی مشابه در کاتالوگ پیدا شدند',
+          statusFarsiMessage: 'فهرست بر اساس تطبیق تصویری و/یا فنی رتبه‌بندی شده است؛ شباهت به‌تنهایی سازگاری قطعی را ثابت نمی‌کند.',
         }
       : {
           status: 'custom_order_available',
           statusFarsiTitle: 'تطبیق قابل اتکا در کاتالوگ پیدا نشد',
-          statusFarsiMessage: 'قطعه با تصویرهای فعلی کاتالوگ تطبیق قابل اتکایی نداشت. کد، ابعاد و نوشته‌های روی قطعه را برای بررسی دقیق‌تر ارسال کنید.',
+          statusFarsiMessage: 'با ویژگی‌های فعلی محصولی از کاتالوگ به حد کافی منطبق نشد؛ هیچ محصولی از روی حدس ساخته یا پیشنهاد نشده است.',
         };
 
   return {
@@ -2826,23 +3256,63 @@ async function analyzePartWithWorker(
     stage,
     model: workerData?.model || 'Cloudflare Gemini Worker',
     fallbackNotice: isRecognizable ? undefined : (workerData?.message || 'تصویر قطعه واضح یا قابل شناسایی نیست.'),
+    catalogSearchWarning: catalogSearchWarning || undefined,
     summary: {
       whatYouSee: raw?.whatYouSee || raw?.what_you_see || visualFeatures.join('، ') || '',
       detectedPartType: detectedType,
-      partFamilyFarsi: String(raw?.category || raw?.type || detectedType),
-      detectedProfile: profileParts.length ? profileParts.join(' | ') : 'مشخصات فنی از تصویر تأیید نشد',
+      partFamilyFarsi: String(raw?.part_family_farsi || raw?.category || raw?.type || detectedType),
+      detectedProfile: profileParts.length ? profileParts.join(' | ') : 'در تصویر/ورودی قابل تأیید نبود',
       material: raw?.material || undefined,
-      visualAnalysis: raw?.visual_analysis || raw?.whatYouSee || visualFeatures.join('، ') || 'تصویر با هوش مصنوعی بررسی و با تصاویر کاتالوگ مقایسه شد.',
-      confidence: hasExact ? Math.max(99, aiConfidence) : aiConfidence,
-      exactVisualMatch: hasExact,
+      visualAnalysis: raw?.visual_analysis || raw?.whatYouSee || visualFeatures.join('، ') || 'تحلیل تصویری در دسترس نیست.',
+      confidence: aiConfidence,
+      exactVisualMatch,
       catalogAvailability,
-      verifiedCandidateCount: exactRaw.length + similarRaw.length,
+      verifiedCandidateCount: exactMatches.length + similarCandidates.length,
     },
     matchedProducts: exactMatches,
     similarCandidates,
     rejectedCandidates: [],
-    technicalAdvice: raw?.technical_advice || 'پیش از سفارش، ابعاد، جنس، نوع اتصال و کد فنی قطعه را با نمونه موجود تطبیق دهید.',
+    technicalAdvice: raw?.technical_advice || 'پیش از سفارش، ابعاد، جنس و کد فنی قطعه را با رکورد محصول و شرایط دستگاه تطبیق دهید.',
     customerImageUrl: uploaded.imageUrl,
+  };
+}
+
+async function saveBase64CustomerImageForWorker(
+  req: express.Request,
+  imageInput: unknown,
+  mimeTypeInput: unknown
+): Promise<{ imageUrl: string; fileName: string }> {
+  const raw = typeof imageInput === 'string' ? imageInput.trim() : '';
+  const maxEncodedBytes = Math.ceil(CUSTOMER_IMAGE_MAX_BYTES * 4 / 3) + 2048;
+  if (!raw || raw.length > maxEncodedBytes) {
+    const error: any = new Error('حجم تصویر بیش از ۱۰ مگابایت است یا دادهٔ تصویر نامعتبر است.');
+    error.statusCode = raw.length > maxEncodedBytes ? 413 : 400;
+    throw error;
+  }
+
+  const dataUrl = raw.match(/^data:([^;,]+);base64,([\s\S]+)$/i);
+  const declaredMime = dataUrl?.[1] || String(mimeTypeInput || 'image/jpeg');
+  const encoded = (dataUrl?.[2] || raw).replace(/\s+/g, '');
+  if (!/^[a-z0-9+/]*={0,2}$/i.test(encoded) || encoded.length % 4 === 1) {
+    const error: any = new Error('دادهٔ Base64 تصویر معتبر نیست.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const buffer = Buffer.from(encoded, 'base64');
+  if (!buffer.length || buffer.length > CUSTOMER_IMAGE_MAX_BYTES ||
+      buffer.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) {
+    const error: any = new Error(buffer.length > CUSTOMER_IMAGE_MAX_BYTES
+      ? 'حجم تصویر بیش از ۱۰ مگابایت است.'
+      : 'دادهٔ تصویر خالی یا نامعتبر است.');
+    error.statusCode = buffer.length > CUSTOMER_IMAGE_MAX_BYTES ? 413 : 400;
+    throw error;
+  }
+
+  const saved = await persistCustomerImage(buffer, declaredMime);
+  return {
+    imageUrl: customerImagePublicUrl(req, saved.fileName),
+    fileName: saved.fileName,
   };
 }
 
@@ -2865,6 +3335,30 @@ app.post('/api/ai/analyze-part', async (req, res) => {
         error: {
           message: error?.message || 'ارتباط با ورکر شناسایی تصویر برقرار نشد.',
           type: status === 504 ? 'timeout' : 'worker_error',
+        },
+      });
+    }
+  }
+
+  // Compatibility for clients that still submit Base64: persist it first,
+  // then send only its public URL and filename through the Worker path.
+  if (
+    !(typeof req.body?.imageUrl === 'string' && req.body.imageUrl.trim()) &&
+    typeof req.body?.imageBase64 === 'string' && req.body.imageBase64.trim()
+  ) {
+    try {
+      const saved = await saveBase64CustomerImageForWorker(req, req.body.imageBase64, req.body.mimeType);
+      const workerBody = { ...req.body, imageUrl: saved.imageUrl, fileName: saved.fileName };
+      delete workerBody.imageBase64;
+      delete workerBody.mimeType;
+      const result = await analyzePartWithWorker(req, workerBody, reqStage);
+      return res.json(result);
+    } catch (error: any) {
+      const status = error?.statusCode || 400;
+      return res.status(status).json({
+        error: {
+          message: error?.message || 'ذخیره یا تحلیل تصویر انجام نشد.',
+          type: status === 504 ? 'timeout' : status >= 500 ? 'worker_error' : 'invalid_image_upload',
         },
       });
     }
@@ -2894,7 +3388,7 @@ app.post('/api/ai/analyze-part', async (req, res) => {
     // (works offline too - no API key needed)
     let visualCandidateResult: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
     if (normalizedImage) {
-      visualCandidateResult = await getVisualCandidateResult(normalizedImage.buffer);
+      visualCandidateResult = await getVisualCandidateResult(normalizedImage.buffer, undefined, false);
     }
 
     const visualMatches = visualCandidateResult.candidates;
@@ -3082,7 +3576,7 @@ ${stageInstruction}
         bboxForRetrieval = { x_min: bb0.x_min, y_min: bb0.y_min, x_max: bb0.x_max, y_max: bb0.y_max };
       }
 
-      visualRes = await getVisualCandidateResult(normalizedImage.buffer, bboxForRetrieval);
+      visualRes = await getVisualCandidateResult(normalizedImage.buffer, bboxForRetrieval, false);
       mergedCandidates = visualRes.candidates;
       exactVisualMatch = visualRes.exactVisualMatch;
       console.log(
@@ -3373,7 +3867,7 @@ ${stageInstruction}
     try {
       const catchImage = await normalizeImageInput(req.body?.imageBase64, req.body?.mimeType);
       if (catchImage) {
-        catchVisualRes = await getVisualCandidateResult(catchImage.buffer);
+        catchVisualRes = await getVisualCandidateResult(catchImage.buffer, undefined, false);
       }
     } catch {
       // ignore

@@ -1204,6 +1204,13 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                 </div>
               )}
 
+              {analysisResult.catalogSearchWarning && (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 mt-0.5" />
+                  <span className="leading-relaxed">{analysisResult.catalogSearchWarning}</span>
+                </div>
+              )}
+
               {/* Summary Bar */}
               <div className="bg-[#55565A] text-white p-4 rounded-2xl space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
@@ -1236,7 +1243,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                   <div className="flex items-center gap-2">
                     <span className="bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 px-3 py-1 rounded-xl text-xs font-bold flex items-center gap-1.5">
                       <CheckCircle2 className="w-3.5 h-3.5" />
-                      <span>ضریب اطمینان: {toPersianDigits(analysisResult.summary.confidence)}٪</span>
+                      <span>اطمینان تحلیل تصویری: {toPersianDigits(analysisResult.summary.confidence)}٪</span>
                     </span>
 
                     <button
@@ -1297,7 +1304,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                     <div>
                       <div className="font-black text-sm text-[#55565A]">می‌خوای دقیق‌تر پیدا کنی؟</div>
                       <p className="text-xs text-slate-600 leading-relaxed">
-                        طول، عرض، گام دندانه و کاربرد دستگاه را وارد کن تا هوش مصنوعی دقیق‌ترین کالای کاتالوگ را معرفی کند.
+                        طول، عرض، گام دندانه و کاربرد دستگاه را وارد کن تا سرور بتواند محصولات واقعی کاتالوگ را دقیق‌تر رتبه‌بندی کند.
                       </p>
                     </div>
                   </div>
@@ -1356,10 +1363,10 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                           }`}
                         >
                           {analysisResult.summary.catalogAvailability.status === 'confirmed_in_catalog'
-                            ? 'تأیید انطباق قطعی (همونه)'
+                            ? 'کد یا تصویر با یک رکورد کاتالوگ تطبیق دارد'
                             : analysisResult.summary.catalogAvailability.status === 'similar_in_catalog'
-                            ? 'مدل جایگزین سازگار (شبیهه)'
-                            : 'امکان ساخت سفارشی اطلس'}
+                            ? 'نامزدهای مرتبط؛ سازگاری فنی تأیید نشده'
+                            : 'نیاز به بررسی یا استعلام سفارشی'}
                         </span>
                       </div>
                       <p className="text-xs text-slate-200 leading-relaxed">
@@ -1370,31 +1377,31 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                 </div>
               )}
 
-              {/* Exact visual match hero banner */}
-              {analysisResult.summary.exactVisualMatch && analysisResult.matchedProducts[0]?.isVisualMatch && (
+              {/* Strong visual evidence banner (not a claim of technical compatibility) */}
+              {analysisResult.summary.exactVisualMatch && analysisResult.matchedProducts.some((item) => item.visualVerdict === 'exact_match') && (
                 <div className="p-3.5 bg-gradient-to-l from-emerald-600 to-teal-600 text-white rounded-2xl flex items-center gap-3 shadow-md">
                   <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
                     <CheckCircle2 className="w-5 h-5" />
                   </div>
                   <div>
-                    <div className="font-black text-sm">🎯 عیناً همین کالا در سایت پیدا شد!</div>
+                    <div className="font-black text-sm">تطبیق تصویری قوی با عکس مرجع کاتالوگ</div>
                     <p className="text-[11px] text-emerald-50 leading-relaxed">
-                      عکس شما با دقت بسیار بالا با تصویر «{analysisResult.matchedProducts[0].name}» ({analysisResult.matchedProducts[0].code}) در کاتالوگ مطابقت دارد.
+                      نزدیک‌ترین تطبیق تصویری: «{analysisResult.matchedProducts.find((item) => item.visualVerdict === 'exact_match')?.name}» ({analysisResult.matchedProducts.find((item) => item.visualVerdict === 'exact_match')?.code}). این نتیجه به‌تنهایی سازگاری فنی را تأیید نمی‌کند.
                     </p>
                   </div>
                 </div>
               )}
 
-              {/* Matched Products List — ONLY 100% exact matches appear here */}
+              {/* Highest-ranked real catalog records returned by the server */}
               {analysisResult.matchedProducts.length > 0 ? (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <h4 className="font-black text-sm text-[#55565A] flex items-center gap-2">
                     <Layers className="w-4 h-4 text-[#E06518]" />
-                    <span>عین قطعه شما در کاتالوگ پیدا شد ({toPersianDigits(analysisResult.matchedProducts.length)} مورد)</span>
+                    <span>بالاترین تطبیق‌های کاتالوگ ({toPersianDigits(analysisResult.matchedProducts.length)} مورد)</span>
                   </h4>
                   <span className="text-xs text-slate-500">
-                    فقط اقلام با انطباق صددرصدی و تأیید راستی‌آزمایی بصری
+                    امتیاز رتبه‌بندی است؛ سازگاری فنی را جداگانه بررسی کنید
                   </span>
                 </div>
 
@@ -1427,10 +1434,15 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                                 <span className="px-2 py-0.5 rounded-lg bg-orange-100 text-[#E06518] font-mono text-xs font-bold">
                                   {match.code}
                                 </span>
-                                <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 text-[11px] font-bold flex items-center gap-1">
-                                  <Zap className="w-3 h-3 text-emerald-600" />
-                                  <span>{toPersianDigits(match.similarityScore)}٪ انطباق</span>
-                                </span>
+                                  <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 text-[11px] font-bold flex items-center gap-1">
+                                    <Zap className="w-3 h-3 text-emerald-600" />
+                                    <span>امتیاز {toPersianDigits(match.similarityScore)} از ۱۰۰</span>
+                                  </span>
+                                  {match.matchType === 'code' && (
+                                    <span className="px-2 py-0.5 rounded-md bg-sky-50 text-sky-700 text-[10px] font-bold">
+                                      کد خوانده‌شده با کد کاتالوگ منطبق است
+                                    </span>
+                                  )}
                                 {match.visualVerdict && (
                                   <span
                                     className={`px-2 py-0.5 rounded-md text-[10px] font-black flex items-center gap-1 ${
@@ -1446,8 +1458,8 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                                     )}
                                     <span>
                                       {match.visualVerdict === 'exact_match'
-                                        ? 'همونه (تأیید تصویری)'
-                                        : 'شبیهه (مدل مشابه)'}
+                                        ? 'تطبیق تصویری قوی'
+                                        : 'نامزد مشابه تصویری'}
                                     </span>
                                   </span>
                                 )}
@@ -1470,7 +1482,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                             <div className="p-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-[11px] text-emerald-950 space-y-1">
                               <div className="flex items-center gap-1 font-bold text-emerald-900">
                                 <Eye className="w-3.5 h-3.5 text-emerald-700" />
-                                <span>راستی‌آزمایی چشمی هوش مصنوعی:</span>
+                                <span>مبنای رتبه‌بندی سرور:</span>
                               </div>
                               <p className="leading-relaxed">{match.visualExplanation}</p>
                             </div>
@@ -1552,10 +1564,10 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                   <div className="p-5 rounded-2xl bg-gradient-to-l from-emerald-600 to-teal-600 text-white shadow-md space-y-1.5">
                     <div className="font-black text-base flex items-center gap-2">
                       <CheckCircle2 className="w-5 h-5 shrink-0" />
-                      <span>این {partFamilyPlural} را داریم</span>
+                      <span>محصولات واقعی مرتبط در کاتالوگ</span>
                     </div>
                     <p className="text-xs text-emerald-50 leading-relaxed">
-                      عینِ قطعه شما در کاتالوگ موجود نیست، اما این {partFamilyPlural} نزدیک‌ترین اقلام کاتالوگ به عکس شما هستند و همین حالا قابل سفارش‌اند:
+                      این {partFamilyPlural} بر اساس شواهد تصویری و/یا ویژگی‌های فنی رتبه‌بندی شده‌اند؛ سازگاری با قطعهٔ شما یا موجودی کالا را پیش از سفارش جداگانه بررسی کنید:
                     </p>
                   </div>
 
@@ -1585,8 +1597,9 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                                   </span>
                                   <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 text-[10px] font-black flex items-center gap-1">
                                     <Sparkles className="w-3 h-3" />
-                                    <span>شبیه است — عین قطعه شما نیست</span>
+                                    <span>{match.matchType === 'technical' ? 'تطبیق فنی/متنی' : match.matchType === 'combined' ? 'تطبیق تصویری و فنی' : 'نامزد مشابه تصویری'}</span>
                                   </span>
+                                  <span className="text-[10px] text-slate-500">امتیاز {toPersianDigits(match.similarityScore)}/۱۰۰</span>
                                 </div>
                                 <h5 className="font-bold text-sm text-[#55565A] leading-snug mt-1 line-clamp-2">
                                   {match.name}
@@ -1691,9 +1704,8 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                       می‌تونیم براتون بسازیم 🔧
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      هوش مصنوعی اطلس عکس شما را با تمام {toPersianDigits(864)} قلم کالای کاتالوگ مقایسه کرد و
-                      هیچ‌کدام انطباق صددرصدی با قطعه شما نداشت؛ یعنی عین همین قطعه در کاتالوگ فعلی موجود نیست.
-                      اما کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی <strong>دقیقاً همین قطعه</strong> را دارد.
+                      با اطلاعات و آستانه‌های فعلی، نتیجهٔ قابل اتکایی از کاتالوگ سرور برنگشت؛ این به‌تنهایی ثابت نمی‌کند که قطعه در کاتالوگ موجود نیست.
+                      برای شناسایی بهتر می‌توانید کد، ابعاد یا کاربرد را اضافه کنید یا از کارشناس استعلام بگیرید.
                     </p>
                     <p className="text-[11px] text-slate-500 leading-relaxed">
                       کافیست همین عکس را برای کارشناسان ما ارسال کنید تا شناسایی دقیق، استعلام قیمت و زمان ساخت اعلام شود.
@@ -1735,7 +1747,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                     <span className="flex items-center gap-2">
                       <Eye className="w-4 h-4 text-amber-600" />
                       <span>
-                        شبیه‌ترین گزینه‌های کاتالوگ — عین قطعه شما نیستند (
+                        سایر نامزدهای رتبه‌بندی‌شده از کاتالوگ (
                         {toPersianDigits(analysisResult.similarCandidates.length)} قلم)
                       </span>
                     </span>
@@ -1748,7 +1760,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                   {showSimilar && (
                     <div className="pt-2 border-t border-amber-200 space-y-2">
                       <p className="text-[11px] text-amber-800 leading-relaxed">
-                        این اقلام از نظر ظاهری نزدیک‌ترین‌ها به عکس شما بودند، اما راستی‌آزمایی چشمی هوش مصنوعی تأیید نکرد که عین قطعه شما باشند؛ صرفاً به‌عنوان مرجع نمایش داده می‌شوند:
+                        این رکوردهای واقعی به‌دلیل امتیاز تصویری و/یا تطبیق ویژگی‌های متنی در رتبه‌های بعدی قرار گرفته‌اند؛ عین یا سازگار بودن آن‌ها تأیید نشده است:
                       </p>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         {analysisResult.similarCandidates.map((rej, rIdx) => {
@@ -1771,7 +1783,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                                 <div className="flex items-center justify-between">
                                   <span className="font-mono text-[10px] text-slate-500 font-bold">{rej.code}</span>
                                   <span className="text-[10px] px-1.5 py-0.5 rounded font-bold bg-amber-100 text-amber-800">
-                                    شبیه است — ولی عین قطعه شما نیست
+                                    {rej.matchType === 'technical' ? 'تطبیق فنی/متنی' : rej.matchType === 'combined' ? 'تطبیق تصویری و فنی' : 'نامزد مشابه تصویری'}
                                   </span>
                                 </div>
                                 <div className="font-bold text-slate-800 text-[11px] truncate">{rej.name}</div>
